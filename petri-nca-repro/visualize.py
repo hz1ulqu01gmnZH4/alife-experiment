@@ -24,8 +24,8 @@ class PetriNCAVisualizer:
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        # Load checkpoint (weights_only=False for config objects)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.config = checkpoint['config']
 
         # Create models
@@ -34,6 +34,7 @@ class PetriNCAVisualizer:
             state_channels=self.config.state_channels,
             hidden_channels=self.config.hidden_channels,
             num_layers=self.config.num_layers,
+            cell_update_rate=getattr(self.config, 'cell_update_rate', 0.5),  # Default for old checkpoints
         ).to(self.device)
 
         self.nca.load_state_dict(checkpoint['nca_state_dict'])

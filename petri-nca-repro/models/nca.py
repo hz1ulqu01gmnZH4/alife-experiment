@@ -26,17 +26,40 @@ class NCAModel(nn.Module):
             state_channels: Number of channels in cell state
             hidden_channels: Number of hidden channels in network
             num_layers: Number of convolutional layers
-            kernel_size: Size of perception kernel
+            kernel_size: Size of perception kernel (must be 3 for Sobel filters)
         """
         super().__init__()
+
+        # Validate inputs
+        assert kernel_size == 3, f"kernel_size must be 3 for Sobel filters, got {kernel_size}"
+        assert state_channels > 0, f"state_channels must be positive, got {state_channels}"
+        assert num_layers >= 1, f"num_layers must be at least 1, got {num_layers}"
 
         self.state_channels = state_channels
         self.hidden_channels = hidden_channels
         self.kernel_size = kernel_size
 
-        # Perception: Extract features from local neighborhood
-        # Input: state_channels * 9 (3x3 neighborhood flattened)
-        perception_size = state_channels * (kernel_size ** 2)
+        # Register fixed Sobel filters for perception (as per original PD-NCA paper)
+        # Sobel filters for gradient estimation in x and y directions
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32) / 8.0
+
+        # Laplacian filter for second derivative
+        laplacian = torch.tensor([[1, 2, 1], [2, -12, 2], [1, 2, 1]], dtype=torch.float32) / 16.0
+
+        # Identity filter to preserve original values
+        identity = torch.zeros((3, 3), dtype=torch.float32)
+        identity[1, 1] = 1.0
+
+        # Stack filters: [4, 1, 3, 3] - identity, sobel_x, sobel_y, laplacian
+        filters = torch.stack([identity, sobel_x, sobel_y, laplacian])
+        filters = filters.unsqueeze(1)  # [4, 1, 3, 3]
+
+        # Register as buffer (not trainable parameter)
+        self.register_buffer('perception_filters', filters)
+
+        # Perception outputs: state_channels * 4 filters
+        perception_size = state_channels * 4
 
         # Build network layers
         layers = []
@@ -68,33 +91,43 @@ class NCAModel(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def perceive(self, state: torch.Tensor) -> torch.Tensor:
-        """Extract local neighborhood features.
+        """Extract local neighborhood features using fixed Sobel filters.
+
+        Efficiently applies 4 perception filters (identity, sobel_x, sobel_y, laplacian)
+        to each state channel using vectorized operations.
 
         Args:
             state: Cell states [batch, channels, height, width]
 
         Returns:
-            Perceived features [batch, channels*9, height, width]
+            Perceived features [batch, channels*4, height, width]
+            (4 filters per channel: identity, sobel_x, sobel_y, laplacian)
         """
-        # Use unfold to extract 3x3 neighborhoods
         batch, channels, height, width = state.shape
 
-        # Pad state for edge handling
-        padded = F.pad(state, (1, 1, 1, 1), mode='circular')
+        # Reshape state to treat each channel independently
+        # [batch, channels, height, width] -> [batch*channels, 1, height, width]
+        state_flat = state.reshape(batch * channels, 1, height, width)
 
-        # Extract 3x3 neighborhoods
-        neighborhoods = F.unfold(
-            padded,
-            kernel_size=self.kernel_size,
-            padding=0
-        )  # [batch, channels*9, height*width]
-
-        # Reshape back to spatial grid
-        neighborhoods = neighborhoods.view(
-            batch, channels * (self.kernel_size ** 2), height, width
+        # Apply all 4 perception filters to all batch*channel instances
+        # perception_filters: [4, 1, 3, 3]
+        # Output: [batch*channels, 4, height, width]
+        perceived_flat = F.conv2d(
+            state_flat,
+            self.perception_filters,
+            padding=1,
         )
 
-        return neighborhoods
+        # Reshape back to separate batch and channel dimensions
+        # [batch*channels, 4, height, width] -> [batch, channels, 4, height, width]
+        perceived = perceived_flat.reshape(batch, channels, 4, height, width)
+
+        # Reorder to interleave filters with channels
+        # [batch, channels, 4, height, width] -> [batch, channels*4, height, width]
+        # This gives: [ch0_f0, ch0_f1, ch0_f2, ch0_f3, ch1_f0, ...]
+        perceived = perceived.reshape(batch, channels * 4, height, width)
+
+        return perceived
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through NCA.
@@ -110,10 +143,10 @@ class NCAModel(nn.Module):
         """
         batch, channels, height, width = state.shape
 
-        # Perceive local neighborhoods
-        perception = self.perceive(state)  # [batch, channels*9, height, width]
+        # Perceive local neighborhoods using Sobel filters
+        perception = self.perceive(state)  # [batch, channels*4, height, width]
 
-        # Reshape for linear layers: [batch, height, width, channels*9]
+        # Reshape for linear layers: [batch, height, width, channels*4]
         perception = perception.permute(0, 2, 3, 1)
 
         # Apply network
@@ -134,6 +167,7 @@ class NCAModel(nn.Module):
         state: torch.Tensor,
         alive_mask: torch.Tensor,
         stochastic: bool = True,
+        update_rate: float = 0.5,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update cell states with stochastic application.
 
@@ -141,6 +175,7 @@ class NCAModel(nn.Module):
             state: Current cell states
             alive_mask: Binary mask of alive cells
             stochastic: Whether to apply updates stochastically
+            update_rate: Probability of updating each cell (only used if stochastic=True)
 
         Returns:
             Tuple of (new_state, attack, defense)
@@ -150,11 +185,15 @@ class NCAModel(nn.Module):
 
         # Apply stochastic updates (only update some cells)
         if stochastic:
-            update_mask = torch.rand_like(state_delta[:, 0:1, :, :]) < 0.5
+            update_mask = torch.rand_like(state_delta[:, 0:1, :, :]) < update_rate
             state_delta = state_delta * update_mask
 
         # Apply updates only to alive cells
         state_delta = state_delta * alive_mask
+
+        # Gate attack/defense by aliveness (dead cells cannot attack/defend)
+        attack = attack * alive_mask
+        defense = defense * alive_mask
 
         # Update state
         new_state = state + state_delta
@@ -172,6 +211,7 @@ class MultiAgentNCA(nn.Module):
         hidden_channels: int = 128,
         num_layers: int = 3,
         kernel_size: int = 3,
+        cell_update_rate: float = 0.5,
     ):
         """Initialize multi-agent NCA system.
 
@@ -181,11 +221,13 @@ class MultiAgentNCA(nn.Module):
             hidden_channels: Hidden channels in NCA networks
             num_layers: Number of layers in NCA networks
             kernel_size: Perception kernel size
+            cell_update_rate: Stochastic update rate per cell
         """
         super().__init__()
 
         self.n_agents = n_agents
         self.state_channels = state_channels
+        self.cell_update_rate = cell_update_rate
 
         # Create independent NCA models for each agent
         self.agents = nn.ModuleList([
@@ -198,7 +240,11 @@ class MultiAgentNCA(nn.Module):
             for _ in range(n_agents)
         ])
 
-    def forward(self, states: torch.Tensor, alive_masks: torch.Tensor):
+    def forward(
+        self,
+        states: torch.Tensor,
+        alive_masks: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update all agents.
 
         Args:
@@ -206,7 +252,10 @@ class MultiAgentNCA(nn.Module):
             alive_masks: Alive masks [n_agents, batch, 1, height, width]
 
         Returns:
-            Tuple of (new_states, attacks, defenses)
+            Tuple of (new_states, attacks, defenses) where each is a tensor with shape:
+                - new_states: [n_agents, batch, channels, height, width]
+                - attacks: [n_agents, batch, 1, height, width]
+                - defenses: [n_agents, batch, 1, height, width]
         """
         new_states = []
         attacks = []
@@ -217,6 +266,7 @@ class MultiAgentNCA(nn.Module):
                 states[i],
                 alive_masks[i],
                 stochastic=True,
+                update_rate=self.cell_update_rate,
             )
             new_states.append(new_state)
             attacks.append(attack)

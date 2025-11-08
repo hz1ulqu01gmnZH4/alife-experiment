@@ -38,6 +38,12 @@ class PetriDish(nn.Module):
         """
         super().__init__()
 
+        # Validate inputs
+        assert grid_size > 0, f"grid_size must be positive, got {grid_size}"
+        assert n_agents > 0, f"n_agents must be positive, got {n_agents}"
+        assert max_agents_per_cell > 0, f"max_agents_per_cell must be positive, got {max_agents_per_cell}"
+        assert 0 < aliveness_threshold < 10, f"aliveness_threshold should be in (0, 10), got {aliveness_threshold}"
+
         self.grid_size = grid_size
         self.state_channels = state_channels
         self.n_agents = n_agents
@@ -167,16 +173,26 @@ class PetriDish(nn.Module):
             sorted_strengths, sorted_indices = torch.sort(strengths, dim=0, descending=True)
 
             # Create masks for agents to keep
-            keep_masks = torch.zeros_like(alive_masks)
-            for i in range(self.max_agents_per_cell):
-                agent_idx = sorted_indices[i]
-                keep_masks.scatter_(0, agent_idx, 1.0)
+            # Start with keeping all agents
+            keep_masks = torch.ones_like(alive_masks)
 
-            # Apply masks only to overcrowded cells
-            kill_mask = (~overcrowded).float()  # Keep all in non-overcrowded cells
-            keep_masks = keep_masks * overcrowded.float() + kill_mask
+            # For overcrowded cells, only keep top max_agents_per_cell
+            # Create ranking mask: 1 for top-k agents, 0 for rest
+            rank_mask = torch.zeros_like(alive_masks)
+            for i in range(min(self.max_agents_per_cell, self.n_agents)):
+                # Create one-hot mask for agent at rank i
+                one_hot = torch.zeros_like(alive_masks)
+                one_hot.scatter_(0, sorted_indices[i:i+1], 1.0)
+                rank_mask += one_hot
 
-            # Kill agents that exceed occupancy limit
+            # Apply rank mask only to overcrowded cells
+            keep_masks = torch.where(
+                overcrowded,  # [batch, 1, height, width]
+                rank_mask,    # Use rank-based mask in overcrowded cells
+                keep_masks,   # Keep all in non-overcrowded cells
+            )
+
+            # Kill agents that exceed occupancy limit by zeroing their states
             states = states * keep_masks
 
         return states
@@ -209,8 +225,10 @@ class PetriDish(nn.Module):
         # Update alive masks after interactions
         alive_masks = self.get_alive_masks(new_states)
 
-        # Update internal state
-        self.states = new_states
+        # Update internal state for next step
+        # Detach to prevent backpropagating through multiple timesteps
+        # Each training step only backprops through one simulation step (continual learning)
+        self.states = new_states.detach()
 
         return new_states, alive_masks
 
@@ -245,7 +263,7 @@ class PetriDish(nn.Module):
             [1.0, 1.0, 0.0],  # Yellow
             [1.0, 0.0, 1.0],  # Magenta
             [0.0, 1.0, 1.0],  # Cyan
-        ], device=self.device)
+        ], dtype=torch.float32, device=self.device)
 
         # Composite agents with their colors
         for i in range(min(self.n_agents, len(colors))):
@@ -260,6 +278,14 @@ class PetriDish(nn.Module):
 
     def compute_diversity_reward(self) -> torch.Tensor:
         """Compute reward based on agent diversity (encourages coexistence).
+
+        Uses variance-based diversity measure. Lower variance in agent populations
+        indicates more balanced coexistence.
+
+        Note: This is a simple baseline. More sophisticated measures could include:
+        - Entropy of spatial distribution
+        - Minimum viable population thresholds
+        - Spatial mixing metrics
 
         Returns:
             Scalar diversity reward

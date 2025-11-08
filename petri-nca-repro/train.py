@@ -40,6 +40,7 @@ class PetriNCATrainer:
             state_channels=config.state_channels,
             hidden_channels=config.hidden_channels,
             num_layers=config.num_layers,
+            cell_update_rate=config.cell_update_rate,
         ).to(self.device)
 
         self.petri_dish = PetriDish(
@@ -93,9 +94,11 @@ class PetriNCATrainer:
         diversity_reward = self.petri_dish.compute_diversity_reward()
         diversity_loss = -diversity_reward
 
-        # Overflow loss: penalize extremely high state values
+        # Overflow loss: penalize extremely high state values with smooth penalty
+        # Use quadratic penalty for better gradient signal
         state_magnitude = states.abs().mean()
-        overflow_loss = torch.relu(state_magnitude - 10.0)
+        overflow_penalty = torch.relu(state_magnitude - 5.0)  # Start penalizing above 5.0
+        overflow_loss = overflow_penalty ** 2  # Quadratic penalty for smooth gradients
 
         # Total loss
         total_loss = survival_loss + 0.5 * diversity_loss + 0.1 * overflow_loss
@@ -123,7 +126,9 @@ class PetriNCATrainer:
         # Reset environment
         self.petri_dish.reset()
 
-        # Training loop
+        # Training loop with continual backpropagation
+        # Each step: forward pass -> compute loss -> backprop -> update
+        # Agents learn online during the simulation (not across timesteps)
         for step in range(self.config.steps_per_epoch):
             # Get current state
             states = self.petri_dish.get_state()
@@ -132,10 +137,17 @@ class PetriNCATrainer:
             # NCA forward pass (agents update their states)
             new_states, attacks, defenses = self.nca(states, alive_masks)
 
+            # Clamp state values to prevent explosion
+            # This is separate from gradient clipping - prevents runaway state values
+            new_states = torch.clamp(new_states, -10.0, 10.0)
+
             # Environment step (apply interactions)
             final_states, final_alive_masks = self.petri_dish.step(
                 new_states, attacks, defenses
             )
+
+            # Clamp again after interactions
+            final_states = torch.clamp(final_states, -10.0, 10.0)
 
             # Compute loss
             losses = self.compute_loss(final_states, final_alive_masks)
@@ -193,7 +205,7 @@ class PetriNCATrainer:
             filename: Checkpoint filename
         """
         path = Path(self.config.checkpoint_dir) / filename
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
